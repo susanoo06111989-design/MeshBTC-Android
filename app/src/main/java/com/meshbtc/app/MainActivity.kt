@@ -2,8 +2,7 @@ package com.meshbtc.app
 
 import android.Manifest
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
+import android.bluetooth.le.*
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
@@ -20,79 +19,208 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import java.util.UUID
+
+private const val TEST_MANUFACTURER_ID = 0xFFFF
+private const val MAX_MESSAGE_BYTES = 14
 
 class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); setContent { MeshScreen() } }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { MeshScreen() }
+    }
 }
 
 @Composable
 fun MeshScreen() {
     val context = LocalContext.current
+    val manager = remember { context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager }
+    val localId = remember { UUID.randomUUID().toString().take(4) }
     var tab by remember { mutableIntStateOf(0) }
     var address by remember { mutableStateOf("") }
-    var status by remember { mutableStateOf("Escaneo detenido") }
+    var draft by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf("Bluetooth detenido") }
+    var scanning by remember { mutableStateOf(false) }
+    var advertising by remember { mutableStateOf(false) }
     val peers = remember { mutableStateListOf<String>() }
-    val manager = remember { context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager }
-    val callback = remember {
-        object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val id = result.device.address.takeLast(5) + " · RSSI " + result.rssi
-                if (peers.none { it.startsWith(result.device.address.takeLast(5)) }) peers.add(id)
+    val messages = remember { mutableStateListOf<String>() }
+    val seen = remember { mutableStateListOf<String>() }
+
+    val advertiseCallback = remember {
+        object : AdvertiseCallback() {
+            override fun onStartFailure(errorCode: Int) {
+                advertising = false
+                status = "No se pudo transmitir: error $errorCode"
             }
-            override fun onScanFailed(errorCode: Int) { status = "Error BLE: $errorCode" }
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+                advertising = true
+                status = "Mensaje transmitiéndose por BLE"
+            }
         }
     }
+    val scanCallback = remember {
+        object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val suffix = result.device.address.takeLast(5)
+                val peer = "$suffix · RSSI ${result.rssi}"
+                if (peers.none { it.startsWith(suffix) }) peers.add(peer)
+                val bytes = result.scanRecord?.getManufacturerSpecificData(TEST_MANUFACTURER_ID)
+                if (bytes != null && bytes.size >= 3) {
+                    val sender = "%02x%02x".format(bytes[0].toInt() and 255, bytes[1].toInt() and 255)
+                    val msg = bytes.copyOfRange(2, bytes.size).toString(Charsets.UTF_8)
+                    val key = "$sender:$msg"
+                    if (key !in seen) {
+                        seen.add(key)
+                        messages.add("Recibido [$sender]: $msg")
+                    }
+                }
+            }
+            override fun onScanFailed(errorCode: Int) {
+                scanning = false
+                status = "Error al buscar: $errorCode"
+            }
+        }
+    }
+
     fun startScan() {
         try {
-            if (manager.adapter?.isEnabled != true) { status = "Activa Bluetooth"; return }
-            val scanner = manager.adapter?.bluetoothLeScanner
-            if (scanner == null) { status = "Escáner BLE no disponible"; return }
-            peers.clear()
-            scanner.startScan(callback)
-            status = "Buscando dispositivos BLE cercanos"
+            val adapter = manager.adapter
+            if (adapter?.isEnabled != true) { status = "Activa Bluetooth"; return }
+            val scanner = adapter.bluetoothLeScanner ?: run { status = "BLE no disponible"; return }
+            if (!scanning) {
+                scanner.startScan(scanCallback)
+                scanning = true
+                status = "Escuchando mensajes BLE cercanos"
+            }
         } catch (_: SecurityException) { status = "Faltan permisos Bluetooth" }
     }
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
-        if (granted.values.all { it }) startScan() else status = "Permisos denegados"
+    fun sendMessage() {
+        val bytes = draft.toByteArray(Charsets.UTF_8)
+        if (bytes.isEmpty() || bytes.size > MAX_MESSAGE_BYTES) {
+            status = "Máximo 14 bytes UTF-8 por mensaje"
+            return
+        }
+        try {
+            val adapter = manager.adapter
+            if (adapter?.isEnabled != true) { status = "Activa Bluetooth"; return }
+            val advertiser = adapter.bluetoothLeAdvertiser ?: run {
+                status = "Este teléfono no admite anuncios BLE"; return
+            }
+            advertiser.stopAdvertising(advertiseCallback)
+            val id = localId.chunked(2).map { it.toInt(16).toByte() }
+            val payload = byteArrayOf(id[0], id[1]) + bytes
+            val data = AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .setIncludeTxPowerLevel(false)
+                .addManufacturerData(TEST_MANUFACTURER_ID, payload)
+                .build()
+            val settings = AdvertiseSettings.Builder()
+                .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+                .setConnectable(false)
+                .setTimeout(0)
+                .build()
+            advertiser.startAdvertising(settings, data, advertiseCallback)
+            messages.add("Enviado [$localId]: $draft")
+            draft = ""
+            status = "Transmitiendo; entrega NO confirmada"
+        } catch (_: SecurityException) { status = "Faltan permisos Bluetooth" }
+    }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+        if (granted.values.all { it }) startScan() else status = "Permisos Bluetooth denegados"
+    }
+    fun requestAndScan() {
+        val permissions = if (Build.VERSION.SDK_INT >= 31)
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
+        else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (permissions.all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED })
+            startScan()
+        else launcher.launch(permissions)
     }
     DisposableEffect(Unit) {
         onDispose {
-            try { manager.adapter?.bluetoothLeScanner?.stopScan(callback) } catch (_: SecurityException) {}
+            try {
+                manager.adapter?.bluetoothLeScanner?.stopScan(scanCallback)
+                manager.adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
+            } catch (_: SecurityException) {}
         }
     }
     MaterialTheme(colorScheme = darkColorScheme()) {
-        Scaffold(topBar = { Surface { Text("MeshBTC · Alpha 1", modifier = Modifier.padding(20.dp), style = MaterialTheme.typography.titleLarge) } },
-            bottomBar = { NavigationBar { listOf("Chats", "Malla", "Bitcoin", "Ajustes").forEachIndexed { index, name -> NavigationBarItem(selected = tab == index, onClick = { tab = index }, icon = { Text(listOf("✉", "◉", "₿", "⚙")[index]) }, label = { Text(name) }) } } }) { padding ->
-            Column(Modifier.fillMaxSize().padding(padding).padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Scaffold(
+            topBar = { Surface { Text("MeshBTC · Alpha 2", Modifier.padding(20.dp), style = MaterialTheme.typography.titleLarge) } },
+            bottomBar = {
+                NavigationBar {
+                    listOf("Chats", "Malla", "Bitcoin", "Ajustes").forEachIndexed { index, name ->
+                        NavigationBarItem(
+                            selected = tab == index,
+                            onClick = { tab = index },
+                            icon = { Text(listOf("✉", "◉", "₿", "⚙")[index]) },
+                            label = { Text(name) }
+                        )
+                    }
+                }
+            }
+        ) { padding ->
+            Column(
+                Modifier.fillMaxSize().padding(padding).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 when (tab) {
-                    0 -> { Text("Mensajería", style = MaterialTheme.typography.headlineSmall); Text("La mensajería entre teléfonos se incorporará en Alpha 2. No se simulan mensajes ni conexiones.") }
+                    0 -> {
+                        Text("Chat BLE experimental", style = MaterialTheme.typography.headlineSmall)
+                        Text("ID temporal: $localId · Sin cifrado ni confirmación de entrega")
+                        Text(status)
+                        Button(onClick = { requestAndScan() }) { Text(if (scanning) "Escuchando" else "Activar recepción") }
+                        OutlinedTextField(
+                            value = draft, onValueChange = { draft = it },
+                            label = { Text("Mensaje corto (máx. 14 bytes)") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text("${draft.toByteArray(Charsets.UTF_8).size}/14 bytes")
+                        Button(
+                            enabled = draft.isNotEmpty() && draft.toByteArray(Charsets.UTF_8).size <= MAX_MESSAGE_BYTES,
+                            onClick = { sendMessage() }
+                        ) { Text("Transmitir por Bluetooth") }
+                        Text("Cada envío sustituye el anuncio anterior. No envíes datos privados.")
+                        LazyColumn { items(messages) { Text(it, Modifier.padding(vertical = 6.dp)) } }
+                    }
                     1 -> {
-                        Text("Dispositivos BLE", style = MaterialTheme.typography.headlineSmall)
+                        Text("Dispositivos Bluetooth LE", style = MaterialTheme.typography.headlineSmall)
                         Text(status)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = {
-                                val permissions = if (Build.VERSION.SDK_INT >= 31) arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
-                                if (permissions.all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) startScan() else permissionLauncher.launch(permissions)
-                            }) { Text("Buscar") }
-                            OutlinedButton(onClick = { try { manager.adapter?.bluetoothLeScanner?.stopScan(callback); status = "Escaneo detenido" } catch (_: SecurityException) { status = "Sin permisos" } }) { Text("Detener") }
+                            Button(onClick = { requestAndScan() }) { Text("Buscar") }
+                            OutlinedButton(onClick = {
+                                try {
+                                    manager.adapter?.bluetoothLeScanner?.stopScan(scanCallback)
+                                    scanning = false
+                                    status = "Escaneo detenido"
+                                } catch (_: SecurityException) { status = "Sin permisos" }
+                            }) { Text("Detener") }
                         }
-                        Text("Detectados: ${peers.size} (no significa que tengan MeshBTC)")
+                        Text("Detectados: ${peers.size} · No todos utilizan MeshBTC")
                         LazyColumn { items(peers) { Text(it, Modifier.padding(8.dp)) } }
                     }
                     2 -> {
                         Text("Recibir Bitcoin", style = MaterialTheme.typography.headlineSmall)
-                        Text("Solo recepción. Introduce una dirección propia; no introduzcas claves privadas.")
-                        OutlinedTextField(value = address, onValueChange = { address = it.trim() }, label = { Text("Dirección Bitcoin") }, modifier = Modifier.fillMaxWidth())
+                        Text("Solo recepción. Nunca introduzcas claves privadas.")
+                        OutlinedTextField(
+                            value = address, onValueChange = { address = it.trim() },
+                            label = { Text("Dirección Bitcoin") }, modifier = Modifier.fillMaxWidth()
+                        )
                         val valid = address.matches(Regex("^(bc1[ac-hj-np-z02-9]{11,87}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$", RegexOption.IGNORE_CASE))
-                        Text(if (valid) "Formato plausible (NO verificado criptográficamente)" else "Introduce una dirección mainnet válida")
+                        Text(if (valid) "Formato plausible; checksum NO verificado" else "Introduce una dirección mainnet")
                         Button(enabled = valid, onClick = {
                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                             clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Bitcoin address", address))
                         }) { Text("Copiar dirección") }
                         HorizontalDivider()
-                        Text("Lightning: integración pendiente. No hay pagos activos ni confirmaciones en esta versión.")
+                        Text("Lightning pendiente. No hay pagos ni confirmaciones activas.")
                     }
-                    else -> { Text("Acerca de MeshBTC"); Text("Alpha 1: descubrimiento BLE experimental y pantalla Bitcoin de solo recepción. Sin chats, malla multi-salto, QR ni Lightning operativos.") }
+                    else -> {
+                        Text("MeshBTC Alpha 2", style = MaterialTheme.typography.headlineSmall)
+                        Text("Prueba de anuncios BLE de texto corto. No hay cifrado, conexión persistente, mensajes largos, retransmisión multisalto ni entrega garantizada.")
+                        Text("La identificación del fabricante 0xFFFF se usa únicamente para pruebas; no es apta para producción.")
+                    }
                 }
             }
         }
