@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import java.util.UUID
@@ -42,6 +43,9 @@ fun MeshScreen() {
     var status by remember { mutableStateOf("Bluetooth detenido") }
     var scanning by remember { mutableStateOf(false) }
     var advertising by remember { mutableStateOf(false) }
+    var scanEvents by remember { mutableIntStateOf(0) }
+    var meshEvents by remember { mutableIntStateOf(0) }
+    var txState by remember { mutableStateOf("Sin transmisión") }
     val peers = remember { mutableStateListOf<String>() }
     val messages = remember { mutableStateListOf<String>() }
     val seen = remember { mutableStateListOf<String>() }
@@ -50,22 +54,26 @@ fun MeshScreen() {
         object : AdvertiseCallback() {
             override fun onStartFailure(errorCode: Int) {
                 advertising = false
-                status = "No se pudo transmitir: error $errorCode"
+                txState = "Error de transmisión BLE: $errorCode"
+                status = txState
             }
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
                 advertising = true
-                status = "Mensaje transmitiéndose por BLE"
+                txState = "Anuncio BLE iniciado; entrega no confirmada"
+                status = txState
             }
         }
     }
     val scanCallback = remember {
         object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
+                scanEvents++
                 val suffix = result.device.address.takeLast(5)
                 val peer = "$suffix · RSSI ${result.rssi}"
                 if (peers.none { it.startsWith(suffix) }) peers.add(peer)
                 val bytes = result.scanRecord?.getManufacturerSpecificData(TEST_MANUFACTURER_ID)
                 if (bytes != null && bytes.size >= 3) {
+                    meshEvents++
                     val sender = "%02x%02x".format(bytes[0].toInt() and 255, bytes[1].toInt() and 255)
                     val msg = bytes.copyOfRange(2, bytes.size).toString(Charsets.UTF_8)
                     val key = "$sender:$msg"
@@ -88,7 +96,10 @@ fun MeshScreen() {
             if (adapter?.isEnabled != true) { status = "Activa Bluetooth"; return }
             val scanner = adapter.bluetoothLeScanner ?: run { status = "BLE no disponible"; return }
             if (!scanning) {
-                scanner.startScan(scanCallback)
+                val settings = ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build()
+                scanner.startScan(null, settings, scanCallback)
                 scanning = true
                 status = "Escuchando mensajes BLE cercanos"
             }
@@ -107,6 +118,8 @@ fun MeshScreen() {
                 status = "Este teléfono no admite anuncios BLE"; return
             }
             advertiser.stopAdvertising(advertiseCallback)
+            advertising = false
+            txState = "Iniciando anuncio BLE..."
             val id = localId.chunked(2).map { it.toInt(16).toByte() }
             val payload = byteArrayOf(id[0], id[1]) + bytes
             val data = AdvertiseData.Builder()
@@ -121,9 +134,9 @@ fun MeshScreen() {
                 .setTimeout(0)
                 .build()
             advertiser.startAdvertising(settings, data, advertiseCallback)
-            messages.add("Enviado [$localId]: $draft")
+            messages.add("Intento de envío [$localId]: $draft")
             draft = ""
-            status = "Transmitiendo; entrega NO confirmada"
+            status = "Intento de transmisión; esperando confirmación del radio BLE"
         } catch (_: SecurityException) { status = "Faltan permisos Bluetooth" }
     }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
@@ -162,7 +175,7 @@ fun MeshScreen() {
             }
         ) { padding ->
             Column(
-                Modifier.fillMaxSize().padding(padding).padding(16.dp),
+                Modifier.fillMaxSize().padding(padding).statusBarsPadding().padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 when (tab) {
@@ -170,6 +183,8 @@ fun MeshScreen() {
                         Text("Chat BLE experimental", style = MaterialTheme.typography.headlineSmall)
                         Text("ID temporal: $localId · Sin cifrado ni confirmación de entrega")
                         Text(status)
+                        Text("Diagnóstico: escaneos=$scanEvents · anuncios MeshBTC=$meshEvents")
+                        Text("Radio: $txState")
                         Button(onClick = { requestAndScan() }) { Text(if (scanning) "Escuchando" else "Activar recepción") }
                         OutlinedTextField(
                             value = draft, onValueChange = { draft = it },
@@ -187,6 +202,8 @@ fun MeshScreen() {
                     1 -> {
                         Text("Dispositivos Bluetooth LE", style = MaterialTheme.typography.headlineSmall)
                         Text(status)
+                        Text("Eventos BLE: $scanEvents · paquetes MeshBTC: $meshEvents")
+                        Text("Radio transmisor: $txState")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { requestAndScan() }) { Text("Buscar") }
                             OutlinedButton(onClick = {
@@ -198,6 +215,7 @@ fun MeshScreen() {
                             }) { Text("Detener") }
                         }
                         Text("Detectados: ${peers.size} · No todos utilizan MeshBTC")
+                        Text("Si eventos BLE=0, revisa permisos, Bluetooth y visibilidad de otros dispositivos.")
                         LazyColumn { items(peers) { Text(it, Modifier.padding(8.dp)) } }
                     }
                     2 -> {
@@ -220,6 +238,7 @@ fun MeshScreen() {
                         Text("MeshBTC Alpha 2", style = MaterialTheme.typography.headlineSmall)
                         Text("Prueba de anuncios BLE de texto corto. No hay cifrado, conexión persistente, mensajes largos, retransmisión multisalto ni entrega garantizada.")
                         Text("La identificación del fabricante 0xFFFF se usa únicamente para pruebas; no es apta para producción.")
+                        Text("Diagnóstico: escaneos=$scanEvents, paquetes MeshBTC=$meshEvents, transmisión=$txState")
                     }
                 }
             }
