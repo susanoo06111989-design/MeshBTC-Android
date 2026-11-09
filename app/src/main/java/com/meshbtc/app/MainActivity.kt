@@ -7,6 +7,9 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -46,6 +49,10 @@ fun MeshScreen() {
     var scanEvents by remember { mutableIntStateOf(0) }
     var meshEvents by remember { mutableIntStateOf(0) }
     var txState by remember { mutableStateOf("Sin transmisión") }
+    var permissionRefresh by remember { mutableIntStateOf(0) }
+    val requiredPermissions = if (Build.VERSION.SDK_INT >= 31) listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE) else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    fun missingPermissions(): List<String> = requiredPermissions.filter { context.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+    val missingNow = permissionRefresh.let { missingPermissions() }
     val peers = remember { mutableStateListOf<String>() }
     val messages = remember { mutableStateListOf<String>() }
     val seen = remember { mutableStateListOf<String>() }
@@ -93,6 +100,7 @@ fun MeshScreen() {
     fun startScan() {
         try {
             val adapter = manager.adapter
+            if (missingPermissions().isNotEmpty()) { scanning = false; status = "Permisos faltantes: ${missingPermissions().joinToString { it.substringAfterLast('.') }}"; return }
             if (adapter?.isEnabled != true) { status = "Activa Bluetooth"; return }
             val scanner = adapter.bluetoothLeScanner ?: run { status = "BLE no disponible"; return }
             if (!scanning) {
@@ -106,6 +114,7 @@ fun MeshScreen() {
         } catch (_: SecurityException) { status = "Faltan permisos Bluetooth" }
     }
     fun sendMessage() {
+        if (missingPermissions().isNotEmpty()) { status = "Permisos Bluetooth faltantes"; return }
         val bytes = draft.toByteArray(Charsets.UTF_8)
         if (bytes.isEmpty() || bytes.size > MAX_MESSAGE_BYTES) {
             status = "Máximo 14 bytes UTF-8 por mensaje"
@@ -140,15 +149,12 @@ fun MeshScreen() {
         } catch (_: SecurityException) { status = "Faltan permisos Bluetooth" }
     }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
-        if (granted.values.all { it }) startScan() else status = "Permisos Bluetooth denegados"
+        permissionRefresh++
+        if (missingPermissions().isEmpty()) startScan() else { scanning = false; status = "Permisos denegados: ${missingPermissions().joinToString { it.substringAfterLast('.') }}" }
     }
     fun requestAndScan() {
-        val permissions = if (Build.VERSION.SDK_INT >= 31)
-            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
-        else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
-        if (permissions.all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED })
-            startScan()
-        else launcher.launch(permissions)
+        val missing = missingPermissions()
+        if (missing.isEmpty()) startScan() else launcher.launch(missing.toTypedArray())
     }
     DisposableEffect(Unit) {
         onDispose {
@@ -160,7 +166,7 @@ fun MeshScreen() {
     }
     MaterialTheme(colorScheme = darkColorScheme()) {
         Scaffold(
-            topBar = { Surface { Text("MeshBTC · Alpha 2", Modifier.padding(20.dp), style = MaterialTheme.typography.titleLarge) } },
+            topBar = { Surface { Text("MeshBTC · Alpha 2.2", Modifier.padding(20.dp), style = MaterialTheme.typography.titleLarge) } },
             bottomBar = {
                 NavigationBar {
                     listOf("Chats", "Malla", "Bitcoin", "Ajustes").forEachIndexed { index, name ->
@@ -184,6 +190,7 @@ fun MeshScreen() {
                         Text("ID temporal: $localId · Sin cifrado ni confirmación de entrega")
                         Text(status)
                         Text("Diagnóstico: escaneos=$scanEvents · anuncios MeshBTC=$meshEvents")
+                        Text("Permisos faltantes: ${missingNow.joinToString { it.substringAfterLast('.') }.ifEmpty { "ninguno" }}")
                         Text("Radio: $txState")
                         Button(onClick = { requestAndScan() }) { Text(if (scanning) "Escuchando" else "Activar recepción") }
                         OutlinedTextField(
@@ -203,6 +210,7 @@ fun MeshScreen() {
                         Text("Dispositivos Bluetooth LE", style = MaterialTheme.typography.headlineSmall)
                         Text(status)
                         Text("Eventos BLE: $scanEvents · paquetes MeshBTC: $meshEvents")
+                        Text("Permisos faltantes: ${missingNow.joinToString { it.substringAfterLast('.') }.ifEmpty { "ninguno" }}")
                         Text("Radio transmisor: $txState")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { requestAndScan() }) { Text("Buscar") }
@@ -239,6 +247,9 @@ fun MeshScreen() {
                         Text("Prueba de anuncios BLE de texto corto. No hay cifrado, conexión persistente, mensajes largos, retransmisión multisalto ni entrega garantizada.")
                         Text("La identificación del fabricante 0xFFFF se usa únicamente para pruebas; no es apta para producción.")
                         Text("Diagnóstico: escaneos=$scanEvents, paquetes MeshBTC=$meshEvents, transmisión=$txState")
+                        Text("Permisos faltantes: ${missingNow.joinToString { it.substringAfterLast('.') }.ifEmpty { "ninguno" }}")
+                        Button(onClick = { permissionRefresh++ }) { Text("Actualizar permisos") }
+                        OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }) { Text("Abrir ajustes de MeshBTC") }
                     }
                 }
             }
